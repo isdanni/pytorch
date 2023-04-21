@@ -935,6 +935,12 @@ class FunctionTests(torch._dynamo.test_case.TestCase):
         x_sum_array = np.asarray(x_sum)
         return torch.from_numpy(x_sum_array)
 
+    @make_test
+    @requires_numpy_pytorch_interop
+    def test_return_numpy_ndarray(x):
+        a = x.numpy()
+        return a.T
+
 
 def global_func_with_default_tensor_args(
     x=torch.zeros((2, 2)), *, kw_x=torch.zeros((1, 2))
