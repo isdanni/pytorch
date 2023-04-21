@@ -272,6 +272,8 @@ def build_data_parallel_strategies(
         operator.getitem,
     ]
 
+    tuple_strategy_ops = [aten._fused_adam.default]
+
     dp_strategy_map: Dict[fx.Node, StrategyType] = {}
     batch_dim_analzer = BatchDimAnalyzer(batch_dim)
     placeholder_idx = 0
@@ -366,6 +368,7 @@ def build_data_parallel_strategies(
             # param + activation (param must be replicate, act be sharded) -> out: activation
             # param/state + grad (param/state/grad be the same spec) -> out: param/state
             # param + state -> out: param
+
             if node.target in non_compute_ops:
                 # At this point, we should have removed all the `tag_grad` nodes in the graph
                 assert node.target != torch.ops._spmd.tag_grad.default
@@ -374,7 +377,6 @@ def build_data_parallel_strategies(
                 assert (
                     len(input_nodes) == 1
                 ), f"non-compute op only support one input now, found node: {node} with length of inputs: {len(node.args)}"
-
                 arg_strategy = dp_strategy_map[input_nodes[0]]
 
                 if node.target == operator.getitem:
@@ -451,6 +453,40 @@ def build_data_parallel_strategies(
                 if has_activation:
                     assert len(produce_param_grad_strat) == 1
                     produce_param_grad_strat[0].input_specs = input_specs
+            elif node.target in tuple_strategy_ops:
+                # ops that need to build tuple strategy instead of normal strategy
+                # This should happen rarely and only needed when we need to generate
+                # different node strategy for multiple outputs (i.e. fused_adam op)
+                # TODO: Currently this specializes to fused optimizer ops, but we need
+                # to see how to generalize this strategy building logic
+                output_strategy_len = len(node.args) - 1
+                tuple_strategies = []
+                for i in range(output_strategy_len):
+                    if not isinstance(node.args[i], list):
+                        raise RuntimeError(
+                            f"Expecting node or list as arg to build Tuple Strategy, but found type {type(node.args[i])}!"
+                        )
+                    # for list/tuple arg, use the first one to find out the node type
+                    if len(node.args[i]) > 0:
+                        arg_strategy = dp_strategy_map[node.args[i][0]]
+                        assert arg_strategy.node_type in [
+                            NodeType.PARAM,
+                            NodeType.GRAD,
+                            NodeType.STATE,
+                        ], "Expecting param/grad/state as arg to build Tuple Strategy!"
+                        replica_strategy = _gen_replicate_strategy(mesh)
+                        shard_strategy = _gen_shard_strategy(mesh, shard_dim=0)
+                        out_node_strategy = DataParallelStrategy(
+                            arg_strategy.node_type, [replica_strategy, shard_strategy]
+                        )
+                    else:
+                        # if the list/tuple is empty, use a dummy tuple strategy
+                        out_node_strategy = TupleStrategy(())
+
+                    tuple_strategies.append(out_node_strategy)
+
+                output_tuple_strategy = TupleStrategy(tuple_strategies)
+                dp_strategy_map[node] = output_tuple_strategy
             else:
                 # NOTE: This is the common region for all regular computation ops
 
@@ -603,8 +639,14 @@ def mark_data_parallel_shardings(
                 # for all tuple elements, assert that then use the first element's strategy as sharding
                 first_strategy = cast(node_strategy.childs[0], DataParallelStrategy)  # type: ignore[name-defined]
                 for child_strategy in node_strategy.childs:
-                    assert isinstance(child_strategy, DataParallelStrategy)
-                    assert child_strategy.strategies == first_strategy.strategies
+                    if isinstance(child_strategy, DataParallelStrategy):
+                        assert child_strategy.strategies == first_strategy.strategies
+                    else:
+                        # if the child strategy is not data parallel strategy, it should be an empty tuple strategy
+                        assert (
+                            isinstance(child_strategy, TupleStrategy)
+                            and len(child_strategy.childs) == 0
+                        )
 
                 node_strategies = first_strategy.strategies
             else:
@@ -689,13 +731,13 @@ def partitioner(graph: GraphModule) -> GraphModule:
                 node.meta["val"] = local_val
         elif node.op == "call_function":
             out_spec = node_sharding.output_spec
-            output_val = node.meta["val"]
 
             # check if there's misaligned sharding, insert reshard if there is
             expected_input_specs = node_sharding.input_specs
             for idx, input_arg in enumerate(node.all_input_nodes):
-                input_arg_spec = input_arg.meta["sharding"].output_spec
-                input_arg_tensor = input_arg.meta["val"]
+                input_arg_sharding = input_arg.meta["sharding"]
+
+                input_arg_spec = input_arg_sharding.output_spec
                 desired_spec = (
                     out_spec
                     if expected_input_specs is None
@@ -703,6 +745,7 @@ def partitioner(graph: GraphModule) -> GraphModule:
                 )
                 if input_arg_spec != desired_spec:
                     input_full_shape = input_arg.meta["tensor_meta"].shape
+                    input_arg_tensor = input_arg.meta["val"]
 
                     # insert reshard operation
                     def reshard_fn(local_tensor: torch.Tensor) -> torch.Tensor:
@@ -725,8 +768,21 @@ def partitioner(graph: GraphModule) -> GraphModule:
                             },
                         )
                     node.replace_input_with(input_arg, output_node)
+
+            if "val" not in node.meta:
+                # if no 'val' in the node meta, we can't do anything about
+                # this node itself, so skip processing it. "val" usually should
+                # always appear in the node meta, but for some complicated ops that
+                # have nested container as return types (i.e. fused adam have tuple[list]
+                # as return type), tracing can't capture the "val" correctly yet.
+                # TODO: See if we can fix this directly in tracing
+                # issue: https://github.com/pytorch/pytorch/issues/99356
+                continue
+
+            output_val = node.meta["val"]
+
             if node.target in shape_adjustment_ops:
-                # for view related op that needs shape, adjust shape if needed
+                # for view related op that needs shape, adjust shape to local shape if needed
                 assert isinstance(output_val, torch.Tensor)
                 local_shape = compute_local_shape(
                     output_val.shape, out_spec.mesh, out_spec.placements
@@ -786,6 +842,10 @@ def partition_data_parallel(
     num_params_buffers = len(params_buffers)
     flattened_states = pytree.tree_flatten(named_states)[0]
     num_states = len(flattened_states)
+
+    changed = graph.graph.eliminate_dead_code()
+    if changed:
+        graph.recompile()
 
     # 1. First build up data parallel strategies for the whole graph
     strategy_map = build_data_parallel_strategies(
